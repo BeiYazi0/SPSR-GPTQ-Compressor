@@ -1,0 +1,355 @@
+import json
+import math
+import os
+
+os.environ["WANDB_API_KEY"] = "4d02f488c1172d6526b17a48144ae7754db9e4dc"
+
+import torch
+import wandb
+import argparse
+from torch import nn
+
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig, AutoTokenizer, TrainingArguments, Trainer, \
+    DataCollatorForSeq2Seq
+from peft import LoraConfig, get_peft_model, PeftModel
+
+from utils import Prompter, ZeroPrompter, create_llama_groups
+
+wandb.login()
+
+wandb.init(project="llama3")
+
+
+# def load_model_tokenizer(ckpt_dir, config_dir):
+#     tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
+#     tokenizer.pad_token = tokenizer.eos_token
+#     tokenizer.pad_token_id = tokenizer.eos_token_id
+#
+#     bnb_config = BitsAndBytesConfig(
+#         load_in_4bit=True,  # 在4bit上，进行量化
+#         bnb_4bit_use_double_quant=True,  # 嵌套量化，每个参数可以多节省0.4位
+#         bnb_4bit_quant_type="nf4",  # NF4（normalized float）或纯FP4量化 博客说推荐NF4
+#         bnb_4bit_compute_dtype=torch.float16
+#     )
+#
+#     model = AutoModelForCausalLM.from_pretrained(
+#         ckpt_dir,
+#         # quantization_config=bnb_config,  # 上面本地模型的配置
+#         device_map="auto",  # 使用GPU的编号
+#         torch_dtype=torch.float32
+#     )
+#
+#     return tokenizer, model
+
+
+def train(args, model, tokenizer):
+    if not args.no_instruction:
+        prompter = Prompter(args.prompt_template_name)
+    else:
+        prompter = ZeroPrompter()
+
+    def tokenize(prompt, add_eos_token=True):
+        result = tokenizer(
+            prompt,
+            truncation=True,
+            max_length=args.cutoff_len,
+            padding=False,
+            return_tensors=None,
+        )
+        if (
+                result["input_ids"][-1] != tokenizer.eos_token_id
+                and len(result["input_ids"]) < args.cutoff_len
+                and add_eos_token
+        ):
+            result["input_ids"].append(tokenizer.eos_token_id)
+            result["attention_mask"].append(1)
+
+        result["labels"] = result["input_ids"].copy()
+
+        return result
+
+    def generate_and_tokenize_prompt(data_point):
+        if 'lamini' in args.data_path.lower():
+            full_prompt = prompter.generate_prompt(
+                data_point["instruction"],
+                None,
+                data_point["response"],
+            )
+        elif 'alpaca' in args.data_path.lower():
+            full_prompt = prompter.generate_prompt(
+                data_point["instruction"],
+                data_point["input"],
+                data_point["output"],
+            )
+        elif "ptb" in args.dataset[0].lower():
+            full_prompt = data_point["sentence"]
+        else:
+            raise NotImplementedError
+
+        tokenized_full_prompt = tokenize(full_prompt)
+        if not args.train_on_inputs:
+            user_prompt = prompter.generate_prompt(
+                data_point["instruction"], data_point["input"] if 'input' in data_point.keys() else None,
+            )
+            tokenized_user_prompt = tokenize(
+                user_prompt, add_eos_token=args.add_eos_token
+            )
+            user_prompt_len = len(tokenized_user_prompt["input_ids"])
+
+            if args.add_eos_token:
+                user_prompt_len -= 1
+
+            tokenized_full_prompt["labels"] = [
+                                                  -100
+                                              ] * user_prompt_len + tokenized_full_prompt["labels"][
+                                                                    user_prompt_len:
+                                                                    ]  # could be sped up, probably
+        return tokenized_full_prompt
+
+    max_seq_length = 512
+    # tokenizer, model = load_model_tokenizer(args.base_model, args.prune_config)
+
+    dataset = load_dataset(args.data_path)
+    train_val = dataset["train"].train_test_split(test_size=args.val_set_size, shuffle=True, seed=42)
+    train_data = (
+        train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+    )
+    val_data = {
+        args.data_path: train_val["test"].shuffle().map(generate_and_tokenize_prompt),
+    }
+
+    # test_data = dataset["test"]["sentence"]
+    # calculate_perplexity(model, tokenizer, test_data)
+
+    gradient_accumulation_steps = args.tune_batch_size // args.micro_batch_size
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    ddp = world_size != 1
+    if ddp:
+        gradient_accumulation_steps = gradient_accumulation_steps // world_size
+    training_args = TrainingArguments(
+        per_device_train_batch_size=args.micro_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        warmup_steps=100,
+        num_train_epochs=args.num_epochs,
+        learning_rate=args.learning_rate,
+        fp16=True,
+        logging_steps=10,
+        logging_first_step=True,
+        optim="adamw_torch",
+        eval_strategy="steps",
+        save_strategy="steps",
+        eval_steps=100,
+        save_steps=200,
+        output_dir=args.output_dir,
+        save_total_limit=20,
+        load_best_model_at_end=True,
+        ddp_find_unused_parameters=None,
+        group_by_length=args.group_by_length,
+        report_to="wandb",
+        run_name=args.output_dir.split('/')[-1],
+        metric_for_best_model="{}_loss".format(args.data_path),
+    )
+
+    # 配置QLora
+    peft_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        target_modules=args.lora_target_modules.split(","),
+        lora_dropout=args.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, peft_config)
+
+    new_layers = []
+    from pruner import IdentityNormLike
+    for layer in model.model.model.layers:
+        if isinstance(layer, IdentityNormLike):
+            replace_layer = IdentityLinearLike(None, None)
+
+            replace_layer.s = torch.nn.Parameter(torch.diag(layer.s.to(torch.float32)))
+            replace_layer.bias = torch.nn.Parameter(layer.bias.to(torch.float32))
+
+            replace_layer.s.requires_grad_(True)
+            replace_layer.bias.requires_grad_(True)
+            new_layers.append(replace_layer)
+        else:
+            new_layers.append(layer)
+    model.model.model.layers = nn.ModuleList(new_layers)
+
+    trainer = Trainer(
+        model=model,
+        train_dataset=train_data,
+        eval_dataset=val_data,
+        args=training_args,
+        data_collator=DataCollatorForSeq2Seq(
+            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+        ),
+    )
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+
+    # calculate_perplexity(model, tokenizer, test_data)
+
+    model = model.merge_and_unload()
+    # model.save_pretrained(args.output_dir)
+    return model
+
+
+def save_finetuned_model_with_identity_linear_like(model, save_path, model_type="llama"):
+    """
+    保存微调后的模型，将IdentityLinearLike清除后保存模型，并单独保存IdentityLinearLike参数。
+    
+    Args:
+        model: 微调后的模型
+        save_path: 保存路径（模型和IdentityLinearLike都基于此路径）
+        model_type: 模型类型
+    """
+    import os
+    from torch import nn
+    
+    # 获取层列表
+    if "Llama" in model_type or "llama" in model_type:
+        layers = model.model.layers
+        cfg = model.config
+        num_layers_attr = "num_hidden_layers"
+    elif "opt" in model_type:
+        layers = model.model.decoder.layers
+        cfg = model.config
+        num_layers_attr = "num_hidden_layers"
+    elif "Qwen" in model_type:
+        layers = model.transformer.h
+        cfg = model.config
+        num_layers_attr = "n_layer"
+    else:
+        layers = model.model.layers
+        cfg = model.config
+        num_layers_attr = "num_hidden_layers"
+    
+    # 收集IdentityLinearLike层的信息
+    identity_linear_info = []
+    new_layers = []
+    original_layer_count = 0
+    
+    for i, layer in enumerate(layers):
+        if isinstance(layer, IdentityLinearLike):
+            # 保存IdentityLinearLike的参数
+            identity_linear_info.append({
+                'index': i,
+                's': layer.s.data.cpu(),
+                'bias': layer.bias.data.cpu()
+            })
+        else:
+            new_layers.append(layer)
+            original_layer_count += 1
+    
+    # 更新层列表，移除IdentityLinearLike
+    if "Llama" in model_type or "llama" in model_type:
+        model.model.layers = nn.ModuleList(new_layers)
+    elif "opt" in model_type:
+        model.model.decoder.layers = nn.ModuleList(new_layers)
+    elif "Qwen" in model_type:
+        model.transformer.h = nn.ModuleList(new_layers)
+    else:
+        model.model.layers = nn.ModuleList(new_layers)
+    
+    # 更新config
+    if hasattr(cfg, num_layers_attr):
+        setattr(cfg, num_layers_attr, len(new_layers))
+    
+    # 保存模型
+    model.save_pretrained(save_path)
+    
+    # 保存IdentityLinearLike参数
+    if identity_linear_info:
+        linear_save_path = save_path + "/linear.pth"
+        torch.save({
+            'identity_linear_layers': identity_linear_info,
+            'model_type': model_type,
+            'original_num_layers': original_layer_count + len(identity_linear_info)
+        }, linear_save_path)
+        print(f"Saved IdentityLinearLike layers to {linear_save_path}")
+    
+    print(f"Model saved to {save_path} with {len(identity_linear_info)} IdentityLinearLike layers removed")
+
+
+class IdentityLinearLike(nn.Module):
+    def __init__(self, s, bias):
+        super().__init__()
+
+        self.s = s
+        self.bias = bias
+
+    def forward(self, hidden_states, *args, **kwargs):
+        use_cache = kwargs["use_cache"] if "use_cache" in kwargs else False
+        output_attentions = kwargs["output_attentions"] if "output_attentions" in kwargs else False
+        past_key_value = kwargs["past_key_value"] if "past_key_value" in kwargs else None
+
+        outputs = (
+            (hidden_states @ self.s.to(device=hidden_states.device) + self.bias.to(device=hidden_states.device)),)
+
+
+        if output_attentions:
+            outputs += (None,)
+
+        if use_cache:
+            outputs += (past_key_value,)
+        return outputs
+
+
+def finetune(model, tokenizer, parser):
+    # parser = argparse.ArgumentParser(description='Tuning Pruned LLM')
+
+    # Model Type&Path
+    # parser.add_argument('--base_model', type=str, help='model name')
+    parser.add_argument('--data_path', type=str, default="yahma/alpaca-cleaned", help='data path')
+    parser.add_argument('--cache_dataset', action="store_true", default=False)
+    parser.add_argument('--extra_val_dataset', type=str, default=None, help='validation datasets. Split with ","')
+    # parser.add_argument('--output_dir', type=str, default="./lora-alpaca", help='output directory')
+
+    # Training Hyperparameters
+    parser.add_argument('--tune_batch_size', type=int, default=64, help='batch size')
+    parser.add_argument('--micro_batch_size', type=int, default=4, help='micro batch size')
+    parser.add_argument('--num_epochs', type=int, default=2, help='number of epochs')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='learning rate')
+    parser.add_argument('--cutoff_len', type=int, default=256, help='cutoff length')
+    parser.add_argument('--val_set_size', type=int, default=2000, help='validation set size')
+    parser.add_argument('--prompt_template_name', type=str, default="alpaca",
+                        help="The prompt template to use, will default to alpaca.")
+    parser.add_argument('--no_instruction', action='store_true', default=False,
+                        help="Whether to use the instruction template or not.")
+
+    # Lora Configuration
+    parser.add_argument('--lora_r', type=int, default=8, help='lora r')
+    parser.add_argument('--lora_alpha', type=int, default=16, help='lora alpha')
+    parser.add_argument('--lora_dropout', type=float, default=0.05, help='lora dropout')
+    parser.add_argument('--lora_target_modules', type=str,
+                        default="q_proj,k_proj,v_proj,o_proj,gate_proj,down_proj,up_proj", help='lora target modules')
+
+    # llm hyperparameters
+    parser.add_argument('--train_on_inputs', default=False, action="store_true",
+                        help='Train on inputs. If False, masks out inputs in loss')
+    # parser.add_argument('--no_prune', default=False, action="store_true",
+    #                     help='tune with no prune')
+    parser.add_argument('--add_eos_token', default=False, action="store_true")
+    parser.add_argument('--group_by_length', default=False, action="store_true",
+                        help="faster, but produces an odd training loss curve")
+
+    # wandb params
+    parser.add_argument('--wandb_project', type=str, default="llama_tune")
+    parser.add_argument('--resume_from_checkpoint', type=str, help="either training checkpoint or final adapter")
+
+    # ddp
+    parser.add_argument('--local_rank', type=int, default=-1)
+
+    args = parser.parse_args()
+    torch_version = int(torch.__version__.split('.')[1])
+    args.torch_version = torch_version
+
+    model = train(args, model, tokenizer)
+    
+    # 保存微调后的模型
+    if args.save_path is not None:
+        save_finetuned_model_with_identity_linear_like(model, args.save_path, model_type=args.base_model if hasattr(args, 'base_model') else "llama")
+    
+    return model

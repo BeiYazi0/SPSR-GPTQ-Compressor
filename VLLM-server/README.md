@@ -2,7 +2,11 @@
 
 ## 概述
 
-本项目实现了将 SPSR (Structured Pruning with Structured Replacement) 压缩后的 Llama 模型与 vLLM 推理引擎的集成部署。通过自定义模型注册和权重加载机制，实现了在 vLLM 中直接加载和运行 SPSR 修改过的模型结构。
+本项目实现了将 SPSR 压缩后的 Llama 模型与 vLLM 推理引擎的集成部署。通过自定义模型注册和权重加载机制，实现了在 vLLM 中直接加载和运行 SPSR 修改过的模型结构。
+
+基于 vLLM 高性能推理框架，充分利用其 Continuous Batching 机制，实现对海量并发请求的高吞吐批量推理能力。系统架构采用 uvicorn + FastAPI 构建异步 HTTP 服务，主线程通过 asyncio 将用户请求提交至 vLLM 推理队列，由独立推理线程完成动态合批计算，并异步返回结果。
+
+同时，项目支持流式推理输出：vLLM 原生提供逐 token 生成能力，结合 FastAPI 可实现按 chunk 的流式响应，客户端可通过 requests 等库逐步接收并实时展示生成过程，从而带来低延迟、顺滑的交互体验。
 
 ### 核心特性
 
@@ -296,7 +300,57 @@ __import__('fpdb').ForkedPdb().set_trace()
 
 ## 性能基准
 
-待测试。
+vllm bench serve     --model /home/jim/nas/yzg/Llama-3-8b/base     --host localhost     --port 8000     --random-input-len 32     --random-output-len 4      --num-prompts  5
+
+llama3-8B-spsr-8 19730m
+============ Serving Benchmark Result ============
+Successful requests:                     5         
+Benchmark duration (s):                  0.11      
+Total input tokens:                      160       
+Total generated tokens:                  20        
+Request throughput (req/s):              44.68     
+Output token throughput (tok/s):         178.74    
+Total Token throughput (tok/s):          1608.64   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          47.32     
+Median TTFT (ms):                        50.26     
+P99 TTFT (ms):                           52.56     
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          18.89     
+Median TPOT (ms):                        18.84     
+P99 TPOT (ms):                           19.06     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           14.16     
+Median ITL (ms):                         18.41     
+P99 ITL (ms):                            20.32     
+==================================================
+
+
+llama3-8B 22398m
+============ Serving Benchmark Result ============
+Successful requests:                     5         
+Benchmark duration (s):                  0.13      
+Total input tokens:                      160       
+Total generated tokens:                  20        
+Request throughput (req/s):              37.61     
+Output token throughput (tok/s):         150.42    
+Total Token throughput (tok/s):          1353.82   
+---------------Time to First Token----------------
+Mean TTFT (ms):                          58.04     
+Median TTFT (ms):                        61.91     
+P99 TTFT (ms):                           63.89     
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          22.47     
+Median TPOT (ms):                        22.48     
+P99 TPOT (ms):                           22.63     
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           22.47     
+Median ITL (ms):                         22.73     
+P99 ITL (ms):                            23.49     
+==================================================
+
+
+
 
 ### 典型配置
 

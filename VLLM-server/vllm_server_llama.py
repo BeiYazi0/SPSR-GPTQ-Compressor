@@ -10,6 +10,7 @@ if __name__=='__main__':
 
     from vllm import AsyncEngineArgs,AsyncLLMEngine
     from vllm.sampling_params import SamplingParams
+    from vllm.lora.request import LoRARequest
     # from modelscope import AutoTokenizer, GenerationConfig,snapshot_download
     from transformers import GenerationConfig,AutoTokenizer
     from huggingface_hub import snapshot_download
@@ -24,11 +25,18 @@ if __name__=='__main__':
     app=FastAPI()
 
     # vLLM参数
-    base_model_path = "/home/jim/nas/yzg/Llama-3-8b/base"  # 基础模型路径
-    model_dir = "/media/ssd/yzg/SPSR-GPTQ-Compressor/checkpoints/Llama3-8B-spsr-8"
+    model_dir = "/media/ssd/yzg/SPSR-GPTQ-Compressor/checkpoints/Llama3-8B-spsr-8-tune"
+    enable_lora = False
     tensor_parallel_size=1
     gpu_memory_utilization=0.8
     dtype='float16'
+    lora_request = None
+
+    adapter_config_path = os.path.join(model_dir, "adapter_config.json")
+    if os.path.exists(adapter_config_path):
+        print(f"LoRA adapter config found at {adapter_config_path}, enabling LoRA weight merge.")
+        enable_lora = True
+        lora_request = LoRARequest("sql_adapter", 1, model_dir)
 
     MASK_64_BITS = (1 << 64) - 1
     def random_uuid() -> str:
@@ -41,8 +49,8 @@ if __name__=='__main__':
         # 1. 先加载原始（或已 SPSR 保存的）transformers 配置与分词器
         # model_dir: 用于 vLLM 目录，依赖于 Base Model 使用的 config
 
-        generation_config = GenerationConfig.from_pretrained(base_model_path, trust_remote_code=True)
-        tokenizer = AutoTokenizer.from_pretrained(base_model_path, fast_tokenizer=True)
+        generation_config = GenerationConfig.from_pretrained(model_dir, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(model_dir, fast_tokenizer=True)
         tokenizer.eos_token_id = generation_config.eos_token_id
         stop_words_ids = [128009]
 
@@ -56,6 +64,7 @@ if __name__=='__main__':
         args.gpu_memory_utilization = gpu_memory_utilization
         args.dtype = dtype
         args.max_num_seqs = 20
+        args.enable_lora = enable_lora
 
         # 3. 加载引擎
         engine = AsyncLLMEngine.from_engine_args(args)
@@ -104,7 +113,7 @@ if __name__=='__main__':
                                         max_tokens=generation_config.max_new_tokens)
         # vLLM异步推理（在独立线程中阻塞执行推理，主线程异步等待完成通知）
         request_id=str(uuid.uuid4().hex)
-        results_iter=engine.generate(prompt=prompt_text,sampling_params=sampling_params,request_id=request_id)
+        results_iter=engine.generate(prompt=prompt_text,sampling_params=sampling_params,request_id=request_id, lora_request=lora_request)
         
         # 流式返回，即迭代transformer的每一步推理结果并反复返回
         if stream:
@@ -213,6 +222,7 @@ if __name__=='__main__':
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
+                lora_request=lora_request
             )
 
             prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))

@@ -663,6 +663,7 @@ class SPSRPlusPruner:
                     "final_layer_count": len(layers),
                     "original_layer_count": original_num_layers,
                     "pruning_ratio": getattr(args, 'final_s', 0.0),
+                    "weight_type": "scale",
                 },
                 
                 # vLLM兼容性配置
@@ -689,6 +690,10 @@ class SPSRPlusPruner:
                 print(f"✅ Tokenizer saved to {args.save_path}")
             except Exception as e:
                 print(f"⚠️  Failed to save tokenizer: {e}")
+
+            generation_config = model.generation_config
+            generation_config.save_pretrained(args.save_path) 
+
         # new_layers = []
         # for layer in layers:
         #     if isinstance(layer, IdentityNormLike):

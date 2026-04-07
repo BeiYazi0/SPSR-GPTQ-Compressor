@@ -136,8 +136,6 @@ def make_parser():
                         help='save path')
     parser.add_argument('--load_spsr_path', type=str, default=None,
                         help='path to load SPSR layers checkpoint')
-    parser.add_argument('--insert', type=str, default=None,
-                        help='path to load IdentityLinearLike layers for insertion')
     parser.add_argument('--load_quant', type=str, default=None, help='path to load quantized layers checkpoint')
 
     parser.add_argument("--gradient_path", type=str, default=None, help="Path to save the gradient.")
@@ -303,7 +301,7 @@ def load_model_tokenizer(args):
 
 def load_spsr_layers(model, load_path, model_type="llama"):
     """
-    Load and apply IdentityNormLike layers to the model based on saved checkpoint.
+    Load and apply IdentityNormLike or IdentityLinearLike layers to the model based on saved checkpoint.
     This handles layer range replacement (from start_index to end_index).
     
     Args:
@@ -312,14 +310,21 @@ def load_spsr_layers(model, load_path, model_type="llama"):
         model_type: Type of model ("llama", "opt", "qwen", etc.)
     """
     from torch import nn
+    import json
     
     # 获取设备
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     
+    # 载入 config.json 获取 weight_type
+    config_path = os.path.join(load_path, "config.json")
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    weight_type = config.get('spsr_metadata', {}).get('weight_type', 'scale')
+    
     # 加载保存的数据
-    load_path = os.path.join(load_path, "spsr_layers.pth")
-    save_data = torch.load(load_path, map_location=device)
+    load_path_file = os.path.join(load_path, "spsr_layers.pth")
+    save_data = torch.load(load_path_file, map_location=device)
     identity_layers_info = save_data['identity_layers']
     
     # 获取层列表
@@ -333,6 +338,7 @@ def load_spsr_layers(model, load_path, model_type="llama"):
         layers = model.model.layers
     
     # 导入 IdentityNormLike 类
+    from fine_tune import IdentityLinearLike
     from pruner import IdentityNormLike
     
     # 从后往前替换（与保存时的逻辑一致），避免索引混乱
@@ -341,16 +347,19 @@ def load_spsr_layers(model, load_path, model_type="llama"):
         end_index = layer_info['end_index']
         s = nn.Parameter(layer_info['s'].to(device, dtype))
         bias = nn.Parameter(layer_info['bias'].to(device, dtype))
-        relu = layer_info['relu']
+        relu = layer_info.get('relu', False)
         
-        # 创建 IdentityNormLike 实例
-        identity_layer = IdentityNormLike(s, bias, relu=relu)
+        # 根据 weight_type 创建相应的层
+        if weight_type == 'linear':
+            identity_layer = IdentityLinearLike(s, bias)
+            print(f"Replaced layers [{start_index}:{end_index}] with IdentityLinearLike")
+        else:
+            identity_layer = IdentityNormLike(s, bias, relu=relu)
+            print(f"Replaced layers [{start_index}:{end_index}] with IdentityNormLike")
         
-        # 删除原始层范围内的层并插入 IdentityNormLike
+        # 删除原始层范围内的层并插入 identity_layer
         new_layers_list = list(layers[:start_index]) + [identity_layer] + list(layers[end_index:])
         layers = nn.ModuleList(new_layers_list)
-        
-        print(f"Replaced layers [{start_index}:{end_index}] with IdentityNormLike")
     
     # 更新模型的层
     if "Llama" in model_type or "llama" in model_type:
@@ -362,88 +371,20 @@ def load_spsr_layers(model, load_path, model_type="llama"):
     else:
         model.model.layers = layers
     
-    # 清除GPU缓存
-    torch.cuda.empty_cache()
-    gc.collect()
-    
-    print(f"Successfully loaded IdentityNormLike layers from {load_path}")
-    return model
-
-
-def load_identity_linear_like_layers(model, load_path, model_type="llama"):
-    """
-    Load and insert IdentityLinearLike layers into the model.
-    
-    Args:
-        model: Pre-trained model to apply layers to
-        load_path: Path to saved checkpoint containing identity linear layer information
-        model_type: Type of model ("llama", "opt", "qwen", etc.)
-    """
-    from torch import nn
-    from fine_tune import IdentityLinearLike
-    
-    # 获取设备
-    device = next(model.parameters()).device
-    dtype = next(model.parameters()).dtype
-    
-    # 加载保存的数据
-    save_data = torch.load(load_path, map_location=device)
-    identity_linear_layers = save_data['identity_linear_layers']
-    
-    # 获取层列表
-    if "Llama" in model_type or "llama" in model_type:
-        layers = model.model.layers
-    elif "opt" in model_type:
-        layers = model.model.decoder.layers
-    elif "Qwen" in model_type:
-        layers = model.transformer.h
-    else:
-        layers = model.model.layers
-    
-    # 插入IdentityLinearLike层
-    new_layers = list(layers)
-    for layer_info in identity_linear_layers:
-        index = layer_info['index']
-        s = nn.Parameter(layer_info['s'].to(device, dtype))
-        bias = nn.Parameter(layer_info['bias'].to(device, dtype))
-        
-        # 创建IdentityLinearLike实例
-        identity_linear_layer = IdentityLinearLike(s, bias)
-        
-        # 插入到指定位置
-        new_layers.insert(index, identity_linear_layer)
-        
-        print(f"Inserted IdentityLinearLike at index {index}")
-    
-    # 更新模型的层
-    if "Llama" in model_type or "llama" in model_type:
-        model.model.layers = nn.ModuleList(new_layers)
-    elif "opt" in model_type:
-        model.model.decoder.layers = nn.ModuleList(new_layers)
-    elif "Qwen" in model_type:
-        model.transformer.h = nn.ModuleList(new_layers)
-    else:
-        model.model.layers = nn.ModuleList(new_layers)
-    
-    # 更新config中的层数
-    cfg = model.config
-    if "Llama" in model_type or "llama" in model_type:
-        num_layers_attr = "num_hidden_layers"
-    elif "opt" in model_type:
-        num_layers_attr = "num_hidden_layers"
-    elif "Qwen" in model_type:
-        num_layers_attr = "n_layer"
-    else:
-        num_layers_attr = "num_hidden_layers"
-    
-    if hasattr(cfg, num_layers_attr):
-        setattr(cfg, num_layers_attr, len(new_layers))
+    # 检测并加载 LoRA 权重
+    adapter_bin_path = os.path.join(load_path, "adapter_model.bin")
+    adapter_safetensors_path = os.path.join(load_path, "adapter_model.safetensors")
+    if os.path.exists(adapter_bin_path) or os.path.exists(adapter_safetensors_path):
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, load_path)
+        model = model.merge_and_unload()
+        print(f"Loaded and merged LoRA weights from {load_path}")
     
     # 清除GPU缓存
     torch.cuda.empty_cache()
     gc.collect()
     
-    print(f"Successfully loaded IdentityLinearLike layers from {load_path}")
+    print(f"Successfully loaded layers from {load_path_file}")
     return model
 
 
@@ -502,12 +443,9 @@ if __name__ == '__main__':
             print(f"Model with loaded SPSR layers ready for evaluation or fine-tuning")
             # 可继续进行后续的gptq, tune, eval等操作
 
-    # 如果指定了插入IdentityLinearLike层的路径，则加载并插入
-    if args.insert is not None:
-        model = load_identity_linear_like_layers(model, args.insert, model_type=args.base_model)
-        torch.cuda.empty_cache()
-        print(f"Model with inserted IdentityLinearLike layers ready for evaluation or fine-tuning")
-
+    print(dict(model.named_parameters()).keys())
+    exit(0)
+    
     layer_sp_dic = {"uniform": Uniform, "owl": OWL, "dlp": DLP, "atp": ATP}
 
     pruner_dic = {

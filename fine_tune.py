@@ -191,86 +191,74 @@ def train(args, model, tokenizer):
 
     # calculate_perplexity(model, tokenizer, test_data)
 
-    model = model.merge_and_unload()
+    # model = model.merge_and_unload()  # 不合并 LoRA
     # model.save_pretrained(args.output_dir)
     return model
 
 
-def save_finetuned_model_with_identity_linear_like(model, save_path, model_type="llama"):
+def save_finetuned_model_with_identity_linear_like(model, tokenizer, save_path, load_spsr_path, model_type="llama"):
     """
-    保存微调后的模型，将IdentityLinearLike清除后保存模型，并单独保存IdentityLinearLike参数。
+    保存微调后的模型，将IdentityLinearLike的权重替换到spsr_layers.pth中，修改config的weight_type为linear，并保存LoRA适配器。
     
     Args:
-        model: 微调后的模型
-        save_path: 保存路径（模型和IdentityLinearLike都基于此路径）
+        model: 微调后的模型（包含LoRA）
+        tokenizer: 分词器
+        save_path: 保存路径
+        load_spsr_path: 原始spsr路径
         model_type: 模型类型
     """
+
     import os
+    import json
     from torch import nn
     
-    # 获取层列表
+    # 载入 spsr_layers.pth
+    spsr_path = os.path.join(load_spsr_path, "spsr_layers.pth")
+    save_data = torch.load(spsr_path, map_location='cpu')
+    identity_layers_info = save_data['identity_layers']
+    
+    # 获取模型中的 IdentityLinearLike
     if "Llama" in model_type or "llama" in model_type:
-        layers = model.model.layers
-        cfg = model.config
-        num_layers_attr = "num_hidden_layers"
+        layers = model.model.model.layers
     elif "opt" in model_type:
-        layers = model.model.decoder.layers
-        cfg = model.config
-        num_layers_attr = "num_hidden_layers"
+        layers = model.model.model.decoder.layers
     elif "Qwen" in model_type:
-        layers = model.transformer.h
-        cfg = model.config
-        num_layers_attr = "n_layer"
+        layers = model.model.transformer.h
     else:
-        layers = model.model.layers
-        cfg = model.config
-        num_layers_attr = "num_hidden_layers"
+        layers = model.model.model.layers
     
-    # 收集IdentityLinearLike层的信息
-    identity_linear_info = []
-    new_layers = []
-    original_layer_count = 0
-    
-    for i, layer in enumerate(layers):
+    # 假设一一对应，替换 s 和 b
+    idx = 0
+    for layer in layers:
         if isinstance(layer, IdentityLinearLike):
-            # 保存IdentityLinearLike的参数
-            identity_linear_info.append({
-                'index': i,
-                's': layer.s.data.cpu(),
-                'bias': layer.bias.data.cpu()
-            })
-        else:
-            new_layers.append(layer)
-            original_layer_count += 1
+            identity_layers_info[idx]['s'] = layer.s.data.cpu()
+            identity_layers_info[idx]['bias'] = layer.bias.data.cpu()
+            idx += 1
     
-    # 更新层列表，移除IdentityLinearLike
-    if "Llama" in model_type or "llama" in model_type:
-        model.model.layers = nn.ModuleList(new_layers)
-    elif "opt" in model_type:
-        model.model.decoder.layers = nn.ModuleList(new_layers)
-    elif "Qwen" in model_type:
-        model.transformer.h = nn.ModuleList(new_layers)
-    else:
-        model.model.layers = nn.ModuleList(new_layers)
+    # 保存修改后的 spsr_layers.pth
+    os.makedirs(save_path, exist_ok=True)
+    torch.save({'identity_layers': identity_layers_info}, os.path.join(save_path, "spsr_layers.pth"))
     
-    # 更新config
-    if hasattr(cfg, num_layers_attr):
-        setattr(cfg, num_layers_attr, len(new_layers))
+    # 载入 config.json
+    config_path = os.path.join(load_spsr_path, "config.json")
+    with open(config_path, 'r') as f:
+        config = json.load(f)
     
-    # 保存模型
+    if 'spsr_metadata' in config:
+        config['spsr_metadata']['weight_type'] = 'linear'
+    
+    # 保存 config
+    with open(os.path.join(save_path, "config.json"), 'w') as f:
+        json.dump(config, f, indent=2)
+    
+    # 保存 LoRA 适配器（不合并）
     model.save_pretrained(save_path)
+    tokenizer.save_pretrained(save_path)
     
-    # 保存IdentityLinearLike参数
-    if identity_linear_info:
-        linear_save_path = save_path + "/linear.pth"
-        torch.save({
-            'identity_linear_layers': identity_linear_info,
-            'model_type': model_type,
-            'original_num_layers': original_layer_count + len(identity_linear_info)
-        }, linear_save_path)
-        print(f"Saved IdentityLinearLike layers to {linear_save_path}")
-    
-    print(f"Model saved to {save_path} with {len(identity_linear_info)} IdentityLinearLike layers removed")
+    # 保存 generation_config.json
+    generation_config = model.generation_config
+    generation_config.save_pretrained(save_path)    
+    print(f"Saved to {save_path}")
 
 
 class IdentityLinearLike(nn.Module):
@@ -306,6 +294,7 @@ def finetune(model, tokenizer, parser):
     parser.add_argument('--cache_dataset', action="store_true", default=False)
     parser.add_argument('--extra_val_dataset', type=str, default=None, help='validation datasets. Split with ","')
     # parser.add_argument('--output_dir', type=str, default="./lora-alpaca", help='output directory')
+    # parser.add_argument('--load_spsr_path', type=str, default=None, help='path to load SPSR layers checkpoint')
 
     # Training Hyperparameters
     parser.add_argument('--tune_batch_size', type=int, default=64, help='batch size')
@@ -350,6 +339,7 @@ def finetune(model, tokenizer, parser):
     
     # 保存微调后的模型
     if args.save_path is not None:
-        save_finetuned_model_with_identity_linear_like(model, args.save_path, model_type=args.base_model if hasattr(args, 'base_model') else "llama")
+        save_finetuned_model_with_identity_linear_like(model, tokenizer, args.save_path, args.load_spsr_path, model_type=args.base_model if hasattr(args, 'base_model') else "llama")
     
+    model = model.merge_and_unload() # 保存好LoRA适配器后再合并，节省存储空间
     return model

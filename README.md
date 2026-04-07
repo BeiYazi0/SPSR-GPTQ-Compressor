@@ -48,7 +48,19 @@ CUDA_VISIBLE_DEVICES=0 python main.py \
 --save_path ./checkpoints/Qwen3-8B-spsr-8
 ```
 
-在七个zero-shot 任务上与其它层剪枝组件替换方法的比较
+spsr layers 单独保存：
+
+```
+/path/to/spsr-model/          # SPSR 处理后的模型目录
+├── config.json              # 包含 SPSR 元数据的配置
+├── generation_config.json
+├── special_tokens_map.json
+├── spsr_layers.pth          # SPSR 层信息
+├── tokenizer.json
+└── tokenizer_config.json
+```
+
+在七个zero-shot 任务上与其它层剪枝组件替换方法的比较（修剪8层）
 
 | 方法 | LLaMA 2-7B | LLaMA 3-8B | Qwen 2.5-7B | Qwen 3-8B |
 | :--- | :---: | :---: | :---: | :---: |
@@ -89,27 +101,8 @@ python main.py \
 | | Taylor+ | 561.52 | 656.17 | 824.25 | 56.12 | 25.74 | 62.17 | 55.71 | 32.60 | 33.71 | 28.84 | 42.13 |
 | | +SPSR | 16.17 | 29.90 | 20.42 | 64.64 | 66.29 | 66.54 | 74.10 | 37.60 | 64.94 | 39.16 | 59.04 |
  
-### vllm 部署
 
-vllm 是一个用于部署大语言模型的推理引擎，支持量化、稀疏、多卡推理等特性。
-
-SPSR 模型的部署详情参见 [VLLM-server](./VLLM-server/README.md)。
-
-性能测试
-
-TTFT（Time to First Token）表示从请求开始到第一个 token 返回的时间。
-TPOT（Time per Output Token）表示每个输出 token 的平均生成时间。
-ITL（Inter-token Latency）表示连续两个 token 之间的延迟。
-
-| 模型 | Request throughput (req/s) | Output token throughput (tok/s) | TTFT(ms) | TPOT(ms) | ITL(ms) |
-| :--- | :--- | :--- | :---: | :---: | :---: |
-| Llama3-8B | 37.61   | 150.42 | 63.89 | 22.63 |23.49  |
-| +spsr-8|  44.68 | 178.74 |52.56  | 19.06   |20.32|
-
-
-
-
-### LoRA 微调
+ ### LoRA 微调
 
 英伟达发布了一份详尽的报告[1]，详细介绍了如何运用剪枝和蒸馏技术来将 Llama 3.1 8B 和 Mistral NeMo-12B 分别压缩为 Llama-3.1-Minitron-4B 和 MN-Minitron-8B。该报告表明，再剪枝后通过大量训练，剪枝导致的性能下降是可以恢复的。实验结果表明，MN-Minitron-8B 的性能与原始的 Mistral NeMo 12B 相当，甚至在使用 40 倍更少的训练令牌（380 亿 vs. 15 万亿）的情况下还超过了 Llama 3.1 8B。同样，Llama-3.1-Minitron-4B 不仅超过了其教师 Llama 3.1 8B 的性能，而且与上一代的 Minitron 4B 相比，仅使用了 150 倍更少的训练令牌（94 亿 vs. 15 万亿）就表现更优。
 
@@ -141,6 +134,20 @@ python main.py \
 --save_path ./checkpoints/Qwen3-8B-spsrs-8-tune
 ```
 
+spsr layers 和 lora adapter 单独保存：
+
+```
+/path/to/spsr-model/          # SPSR 处理后的模型目录
+├── adapter_config.json
+├── adapter_model.safetensors  # LoRA adapter 参数
+├── config.json                # 包含 SPSR 元数据的配置
+├── generation_config.json
+├── special_tokens_map.json
+├── spsr_layers.pth           # SPSR 层信息
+├── tokenizer.json
+└── tokenizer_config.json
+```
+
 在数据集 yahma/alpaca-cleaned 上训练2个 epoch后，zero-shot表现如下。
 
 | model           | Acc   |
@@ -169,6 +176,26 @@ python main.py \
 | SPSR            | 6.90  |
 | SPSR+LoRA       | 47.69 |
 | **Qwen3-4B**    | 49.73 |
+
+
+### vllm 部署
+
+vllm 是一个用于部署大语言模型的推理引擎，支持量化、稀疏、多卡推理等特性。
+
+SPSR 模型的部署详情参见 [VLLM-server](./VLLM-server/README.md)。
+
+性能测试
+
+TTFT（Time to First Token）表示从请求开始到第一个 token 返回的时间。
+TPOT（Time per Output Token）表示每个输出 token 的平均生成时间。
+ITL（Inter-token Latency）表示连续两个 token 之间的延迟。
+
+| 模型 | Request throughput (req/s) | Output token throughput (tok/s) | TTFT(ms) | TPOT(ms) | ITL(ms) |
+| :--- | :--- | :--- | :---: | :---: | :---: |
+| Llama3-8B | 37.61   | 150.42 | 63.89 | 22.63 |23.49  |
+| +spsr-8|  44.68 | 178.74 |52.56  | 19.06   |20.32|
+
+
 
 ### 量化
 

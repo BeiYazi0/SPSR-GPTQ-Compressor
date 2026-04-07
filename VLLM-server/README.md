@@ -207,7 +207,6 @@ args.max_num_seqs = 20
 在 `vllm_server_llama.py` 中更新路径：
 
 ```python
-base_model_path = "/path/to/base-model"  # 基础模型路径
 model_dir = "/path/to/spsr-model"        # SPSR 模型目录
 ```
 

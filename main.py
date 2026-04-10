@@ -50,8 +50,8 @@ class MultiChoice:
 @torch.no_grad()
 def eval_zero(args, model, tokenizer, task_names):
     if "gsm8k" in task_names:
-        from utils import eval_gsm8k_zero_shot
-        eval_gsm8k_zero_shot(model, tokenizer)
+        from utils import eval_gsm8k_zero_shot, eval_gsm8k_8_shot
+        eval_gsm8k_8_shot(model, tokenizer)
         task_names.pop(task_names.index("gsm8k"))
 
     if len(task_names) == 0:
@@ -232,10 +232,12 @@ def make_parser():
     parser.add_argument('--act-order', action='store_true', help='Whether to apply the activation order GPTQ heuristic')
     parser.add_argument('--sym', action='store_true', help='Whether to perform symmetric quantization.')
 
-    parser.add_argument('--wbits', type=int, default=16, choices=[2, 3, 4, 8],
+    parser.add_argument('--wbits', type=int, default=4, choices=[2, 3, 4, 8],
                         help='#bits to use for quantization; use 16 for evaluating base model.')
     parser.add_argument('--percdamp', type=float, default=.01,
                         help='Percent of the average Hessian diagonal to use for dampening.')
+    parser.add_argument('--benchmark', action='store_true', help='benchmark the quantized model')
+   
 
     ## spsr
     parser.add_argument("--output_dir", default="/media/data/yzg", type=str, help="output_dir")
@@ -288,14 +290,43 @@ def load_model_tokenizer(args):
     if args.bf16:
         dtype = torch.bfloat16
 
-    model = AutoModelForCausalLM.from_pretrained(
-        ckpt_dir,
-        trust_remote_code=True,
-        # quantization_config=bnb_config,  # 上面本地模型的配置
-        # device_map="cpu" if args.deepsparse else "auto",  # 使用GPU的编号
-        device_map="auto",
-        torch_dtype=dtype,
-    )
+    # from awq import AutoAWQForCausalLM
+    # model = AutoAWQForCausalLM.from_pretrained(ckpt_dir,device_map="auto",
+    #     torch_dtype=dtype)
+    # quant_config = {"zero_point": True, "q_group_size": 128, "w_bit": 4, "version":"GEMM"}
+    # model.quantize(tokenizer, quant_config=quant_config)
+    # # save model weights
+    # model.save_quantized(args.save_path)
+    # tokenizer.save_pretrained(args.save_path)
+    # exit(0)
+
+    # model = AutoAWQForCausalLM.from_quantized(ckpt_dir, fuse_layers=True)
+    # model.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # return tokenizer, model
+
+    if args.load_quant is not None:
+        from transformers import modeling_utils
+        def noop(*args, **kwargs):
+            pass
+
+        torch.nn.init.kaiming_uniform_ = noop
+        torch.nn.init.uniform_ = noop
+        torch.nn.init.normal_ = noop
+
+        torch.set_default_dtype(torch.half)
+        modeling_utils._init_weights = False
+        torch.set_default_dtype(torch.half)
+        model = AutoModelForCausalLM.from_pretrained(ckpt_dir)
+        torch.set_default_dtype(torch.float)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            ckpt_dir,
+            trust_remote_code=True,
+            # quantization_config=bnb_config,  # 上面本地模型的配置
+            # device_map="cpu" if args.deepsparse else "auto",  # 使用GPU的编号
+            device_map="auto",
+            torch_dtype=dtype,
+        )
     return tokenizer, model
 
 
@@ -428,6 +459,60 @@ def remove_layers_and_update_config(model, remove_indices, model_type="llama"):
     return layers
 
 
+def benchmark(model, check=True):
+    DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    from datas import get_examples
+    dataloader = get_examples("c4", tokenizer, n_samples=args.num_examples, seq_len=2048)
+    input_ids = dataloader[0].unsqueeze(0).to(DEV)  # (1, seq_len)
+
+    print(input_ids.shape)
+
+    input_ids = input_ids.to(model.gpus[0] if hasattr(model, 'gpus') else DEV)
+    torch.cuda.synchronize()
+
+    from transformers import DynamicCache
+    past_key_values = DynamicCache()
+
+    print('Benchmarking ...')
+
+    if check:
+        loss = torch.nn.CrossEntropyLoss()
+        tot = 0.
+
+    def sync():
+        if hasattr(model, 'gpus'):
+            for gpu in model.gpus:
+                torch.cuda.synchronize(gpu)
+        else:
+            torch.cuda.synchronize()
+
+    max_memory = 0
+    with torch.no_grad():
+        attention_mask = torch.ones((1, input_ids.numel()), device=DEV)
+        times = []
+        for i in range(input_ids.numel()):
+            tick = time.time()
+            out = model(input_ids[:, i:i + 1], past_key_values=past_key_values, attention_mask=attention_mask[:, :(i + 1)].reshape((1, -1)))
+            sync()
+            times.append(time.time() - tick)
+            # print(i, times[-1])
+            if hasattr(model, 'gpus'):
+                mem_allocated = sum(torch.cuda.memory_allocated(gpu) for gpu in model.gpus) / 1024 / 1024
+            else:
+                mem_allocated = torch.cuda.memory_allocated() / 1024 / 1024
+            max_memory = max(max_memory, mem_allocated)
+            if check and i != input_ids.numel() - 1:
+                tot += loss(out.logits[0].to(DEV), input_ids[:, (i + 1)].to(DEV)).float()
+             
+            del out
+        sync()
+        print('Median:', np.median(times))
+        if check:
+            print('PPL:', torch.exp(tot / (input_ids.numel() - 1)).item())
+            print('max memory(MiB):', max_memory)
+
+
 if __name__ == '__main__':
     parser = make_parser()
     args = parser.parse_args()
@@ -443,9 +528,6 @@ if __name__ == '__main__':
             print(f"Model with loaded SPSR layers ready for evaluation or fine-tuning")
             # 可继续进行后续的gptq, tune, eval等操作
 
-    print(dict(model.named_parameters()).keys())
-    exit(0)
-    
     layer_sp_dic = {"uniform": Uniform, "owl": OWL, "dlp": DLP, "atp": ATP}
 
     pruner_dic = {
@@ -492,9 +574,13 @@ if __name__ == '__main__':
         remove_layers_and_update_config(model, args.remove_list, model_type=args.base_model)
     torch.cuda.empty_cache()
 
-    if args.gptq:
-        from gptq import llama_gptq
+    if args.gptq or args.load_quant is not None:
+        from quant4bit.gptq import llama_gptq
         model = llama_gptq(model, tokenizer, dev=model.device, args=args)
+        torch.cuda.empty_cache()
+        
+    if args.benchmark:
+        benchmark(model)
 
     if args.tune:
         model.half()

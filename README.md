@@ -194,12 +194,36 @@ ITL（Inter-token Latency）表示连续两个 token 之间的延迟。
 | :--- | :--- | :--- | :---: | :---: | :---: |
 | Llama3-8B | 37.61   | 150.42 | 63.89 | 22.63 |23.49  |
 | +spsr-8|  44.68 | 178.74 |52.56  | 19.06   |20.32|
-
+| +AutoAWQ-4bit|  61.29 | 245.17 |38.62  | 13.97   |14.60|
 
 
 ### 量化
 
-保存后，内存占用减少了。推理速度很慢，只有短序列（<128）调用 CUDA kernel，考虑更换为 triton 实现。
+在 CPU Intel(R)Xeon (R)CPUE5-2699 和 GPU NVIDIA GeForce RTX 3090 上进行测试，相比 fp16，4-bit 量化减少了 60% 的内存占用，同时性能损失在 10% 以内。
+
+量化后推理速度没有提升，甚至更慢。
+
+当 Batch Size 较小时，推理过程主要受限于内存带宽。这意味着GPU从显存中读取庞大模型权重的速度是瓶颈。量化将模型权重的体积显著缩小（例如缩小3倍），大大减少了需要从内存中搬运的数据量，从而加快了数据读取速度。
+
+当 Batch Size 较大时，推理过程主要受限于计算能力。此时，GPU的大部分时间都花在了矩阵乘法运算上。量化模型（如W4A16）虽然存储的是INT4格式的权重，但在计算时需要先将其反量化为FP16格式。这个额外的转换步骤会带来计算开销，反而拖慢了整体的生成速度。
+
+如 SmoothQuant 这种对权重和激活都量化的方法，中间可以省去反量化步骤，从而避免了额外的计算开销，可以比未量化模型快。
+
+使用 AutoAWQ 量化，vLLM 部署，短序列、小批量场景下推理速度相比原模型有提升。
+
+| LLaMA3-8B | Bits | group-size | memory(MiB) | TPOT(ms) | C4 |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| fp16 | - | -| 15580 | 46.9| 6.54 | 
+| AutoAWQ | 4 | 128 | 5726 | 94.1 | 6.86 |
+| GPTQ(me) | 4 | 128 | 5832 | 47.2 | 11.20 |
+| GPTQ(me) | 4 | -1 | 5705 | 56.2 | 7.98 |
+
+cuda kernel 
+
+```shell
+cd quant4bit
+python setup.py install
+```
 
 模型量化示例：
 
@@ -209,28 +233,16 @@ python main.py \
 --tasks wikitext,ptb,c4,storycloze,rte,openbookqa,arc_easy,winogrande,arc_challenge,piqa,boolq,hellaswag,gsm8k \
 --fp16 \
 --gptq --wbits 4 --act-order
-```
-
-暂未实现 SPSR 模型量化
-
-下面是一个使用 SPSR 进行剪枝后量化的示例：
-
-```shell
-python main.py \
---base_model ./checkpoints/Qwen3-8B-spsrs-8-tune \
---insert ./checkpoints/Qwen3-8B-spsrs-8-tune/linear.pth \
---tasks wikitext,ptb,c4,storycloze,rte,openbookqa,arc_easy,winogrande,arc_challenge,piqa,boolq,hellaswag,gsm8k \
---fp16 \
---gptq --wbits 4 --act-order
+--save_path ./checkpoints/Qwen3-8B-spsrs-8-4bit
 ```
 
 加载量化模型
 
 ```shell
 python main.py \
---base_model ./checkpoints/Qwen3-8B-spsrs-8-tune \
---insert ./checkpoints/Qwen3-8B-spsrs-8-tune/linear.pth \
+--base_model Qwen/Qwen3-8B \
 --tasks wikitext,ptb,c4,storycloze,rte,openbookqa,arc_easy,winogrande,arc_challenge,piqa,boolq,hellaswag,gsm8k \
 --fp16 \
---load_quant ./checkpoints/Qwen3-8B-spsrs-8-tune/quantized.pth
+--gptq --wbits 4 --act-order
+--load_quant ./checkpoints/Qwen3-8B-spsrs-8-4bit
 ```

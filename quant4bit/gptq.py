@@ -1,50 +1,27 @@
-import argparse
+import math
 import time
-import numpy as np
+
 import torch
 import torch.nn as nn
-# import quant
-import quant_util as quant
 import transformers
-import math
-
+from . import quant
 from texttable import Texttable
-
 from datas import get_examples
 
-
-def find_layers(module, layers=[nn.Linear], name=''):
-    """
-    Recursively find the layers of a certain type in a module.
-
-    Args:
-        module (nn.Module): PyTorch module.
-        layers (list): List of layer types to find.
-        name (str): Name of the module.
-
-    Returns:
-        dict: Dictionary of layers of the given type(s) within the module.
-    """
-    if type(module) in layers:
-        return {name: module}
-    res = {}
-    for name1, child in module.named_children():
-        res.update(find_layers(
-            child, layers=layers, name=name + '.' + name1 if name != '' else name1
-        ))
-    return res
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
 
 
 def torch_snr_error(y_pred: torch.Tensor, y_real: torch.Tensor, reduction: str = 'mean') -> torch.Tensor:
     """
     Compute SNR between y_pred(tensor) and y_real(tensor)
-
+    
     SNR can be calcualted as following equation:
-
+    
         SNR(pred, real) = (pred - real) ^ 2 / (real) ^ 2
-
+    
     if x and y are matrixs, SNR error over matrix should be the mean value of SNR error over all elements.
-
+    
         SNR(pred, real) = mean((pred - real) ^ 2 / (real) ^ 2)
     Args:
         y_pred (torch.Tensor): _description_
@@ -266,6 +243,29 @@ class GPTQ:
         torch.cuda.empty_cache()
 
 
+def find_layers(module, layers=[nn.Linear], name=''):
+    """
+    Recursively find the layers of a certain type in a module.
+
+    Args:
+        module (nn.Module): PyTorch module.
+        layers (list): List of layer types to find.
+        name (str): Name of the module.
+
+    Returns:
+        dict: Dictionary of layers of the given type(s) within the module.
+    """
+    if type(module) in layers:
+        return {name: module}
+    res = {}
+    for name1, child in module.named_children():
+        res.update(find_layers(
+            child, layers=layers, name=name + '.' + name1 if name != '' else name1
+        ))
+    return res
+
+
+
 @torch.no_grad()
 def llama_sequential(model, dataloader, dev, args):
     print('Starting ...')
@@ -314,9 +314,6 @@ def llama_sequential(model, dataloader, dev, args):
     for i in range(len(layers)):
 
         print(f'Quantizing layer {i + 1}/{len(layers)}..')
-        # print('+------------------+--------------+------------+-----------+-------+')
-        # print('|       name       | weight_error | fp_inp_SNR | q_inp_SNR | time  |')
-        # print('+==================+==============+============+===========+=======+')
 
         layer = layers[i]
         if f"model.layers.{i}" in model.hf_device_map:
@@ -378,21 +375,9 @@ def llama_sequential(model, dataloader, dev, args):
 
 
 def llama_pack(model, quantizers, wbits, groupsize):
-    # layers = find_layers(model)
-    # layers = {n: layers[n] for n in quantizers}
-    # quant.make_quant_linear(model, quantizers, wbits, groupsize)
-    # qlayers = find_layers(model, [quant.QuantLinear])
-    # print('Packing ...')
-    # for name in qlayers:
-    #     print(name)
-    #     quantizers[name], scale, zero, g_idx, _, _ = quantizers[name]
-    #     qlayers[name].pack(layers[name], scale, zero, g_idx)
-    # print('Done.')
-    # return model
-
     layers = find_layers(model)
     layers = {n: layers[n] for n in quantizers}
-    quant.make_quant(model, quantizers, wbits, groupsize)
+    quant.make_quant_linear(model, quantizers, wbits, groupsize)
     qlayers = find_layers(model, [quant.QuantLinear])
     print('Packing ...')
     for name in qlayers:
@@ -403,23 +388,9 @@ def llama_pack(model, quantizers, wbits, groupsize):
     return model
 
 
-def llama_gptq(model, tokenizer, dev, args):
-    if args.load_quant is not None:
-        return load_quant(model, args.load_quant, args.wbits, args.block, dev=dev)
-
-    print("loading calibdation data")
-    dataloader = get_examples("c4", tokenizer, n_samples=args.num_examples, seq_len=2048)
-    print("dataset loading complete")
-    quantizers = llama_sequential(model, dataloader, dev, args)
-
-    model = llama_pack(model, quantizers, args.wbits, args.block)
-
-    if args.save_path is not None:
-        torch.save(model.state_dict(), args.save_path)
-    return model
-
-
-def load_quant(model, checkpoint, wbits, groupsize=-1, dev=None):
+def load_quant(model, checkpoint, wbits, groupsize=-1, fused_mlp=True, eval=True, warmup_autotune=True, act_order=True):
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     def noop(*args, **kwargs):
         pass
     torch.nn.init.kaiming_uniform_ = noop 
@@ -435,7 +406,7 @@ def load_quant(model, checkpoint, wbits, groupsize=-1, dev=None):
     for name in ['lm_head']:
         if name in layers:
             del layers[name]
-    quant.make_quant(model, layers, wbits, groupsize)
+    quant.make_quant_linear(model, layers, wbits, groupsize)
 
     del layers
     
@@ -446,10 +417,39 @@ def load_quant(model, checkpoint, wbits, groupsize=-1, dev=None):
     else:
         model.load_state_dict(torch.load(checkpoint, map_location=dev), strict=False)
 
+    # if eval:
+    #     quant.make_quant_attn(model)
+    #     quant.make_quant_norm(model)
+    #     if fused_mlp:
+    #         quant.make_fused_mlp(model)
+
+    if warmup_autotune:
+        quant.autotune_warmup_linear(model, transpose=not (eval))
+        if eval and fused_mlp:
+            quant.autotune_warmup_fused(model)
+
     torch.cuda.empty_cache()
     model = model.to(dev)
-    # quant.make_quant_attn(model)
     model.seqlen = 2048
     print('Done.')
 
     return model
+
+
+def llama_gptq(model, tokenizer, dev, args):
+    assert args.wbits in [4], 'Only 4 bits are supported.'
+    if args.load_quant is not None:
+        return load_quant(model, args.load_quant, args.wbits, args.block, act_order=args.act_order)
+
+    print("loading calibdation data")
+    dataloader = get_examples("c4", tokenizer, n_samples=args.num_examples, seq_len=2048)
+    print("dataset loading complete")
+    quantizers = llama_sequential(model, dataloader, dev, args)
+
+    model = llama_pack(model, quantizers, args.wbits, args.block)
+
+    if args.save_path is not None:
+        torch.save(model.state_dict(), args.save_path)
+    return model
+
+

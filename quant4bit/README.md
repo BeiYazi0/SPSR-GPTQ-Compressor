@@ -1,5 +1,7 @@
 # 量化
 
+The implementation of GPTQ is build upon the [GPTQ-for-LLaMa](https://github.com/qwopqwop200/GPTQ-for-LLaMa/tree/fastest-inference-4bit) repositories.
+
 ```shell
 cd ./quant4bit
 python setup.py install

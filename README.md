@@ -225,6 +225,8 @@ cd quant4bit
 python setup.py install
 ```
 
+GPTQ 实现见 [quant4bit](./quant4bit/README.md)。
+
 模型量化示例：
 
 ```shell

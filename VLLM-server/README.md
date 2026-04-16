@@ -1,5 +1,7 @@
 # SPSR-GPTQ-Compressor VLLM 部署指南
 
+The implementation of VLLM-server is build upon the [deepspeed-sft](https://github.com/RyanZxucheng/deepspeed-sft) repositories.
+
 ## 概述
 
 本项目实现了将 SPSR 压缩后的 Llama 模型与 vLLM 推理引擎的集成部署。通过自定义模型注册和权重加载机制，实现了在 vLLM 中直接加载和运行 SPSR 修改过的模型结构。

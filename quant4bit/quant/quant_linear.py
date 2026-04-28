@@ -91,9 +91,9 @@ try:
         first_pid_m = group_id * GROUP_SIZE_M
         group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
         pid_m = first_pid_m + (pid % group_size_m)
-        pid_n = (pid % num_pid_in_group) // group_size_m
+        pid_n = (pid % num_pid_in_group) // group_size_m # pid % num_pid_in_group 取组内偏移，再除以 group_size_m 得到“第几列块”。
 
-        offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M) # 当前 tile 覆盖的 A/C 行号（长度 BLOCK_SIZE_M）
         offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)  # (BLOCK_SIZE_M, BLOCK_SIZE_K)

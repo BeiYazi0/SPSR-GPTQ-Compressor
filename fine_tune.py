@@ -335,6 +335,9 @@ def finetune(model, tokenizer, parser):
     torch_version = int(torch.__version__.split('.')[1])
     args.torch_version = torch_version
 
+    if "Qwen3" in args.base_model or "Qwen2.5" in args.base_model or "Qwen1.5" in args.base_model:
+        args.base_model = args.base_model.replace("Qwen", "LlamaQwen")
+
     model = train(args, model, tokenizer)
     
     # 保存微调后的模型

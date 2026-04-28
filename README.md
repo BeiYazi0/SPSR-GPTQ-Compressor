@@ -170,12 +170,25 @@ spsr layers 和 lora adapter 单独保存：
 | model           | GSM8K |
 |-----------------|-------|
 | **Qwen2.5-7B**  | 35.48 |
+| Streamline+LoRA | 6.07 |
 | SPSR            | 15.77 |
 | SPSR+LoRA       | 31.99 |
 | **Qwen3-8B**    | 51.40 |
+| Streamline+LoRA | 41.17 |
 | SPSR            | 6.90  |
 | SPSR+LoRA       | 47.69 |
 | **Qwen3-4B**    | 49.73 |
+
+在GSM8K上的8-shot结果如下。
+
+| model           | GSM8K |
+|-----------------|-------|
+| **Qwen3-8B**    | 91.43 |
+| Streamline+LoRA | 57.62 |
+| SPSR            | 26.08 |
+| SPSR+LoRA       | 62.47 |
+| **Qwen3-4B**    | 82.18 |
+
 
 
 ### vllm 部署

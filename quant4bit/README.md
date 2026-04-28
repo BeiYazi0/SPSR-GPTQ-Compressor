@@ -383,3 +383,127 @@ Triton kernel 里关键点，`fusedmatmul_248_kernel` 中：
 - `qweight`/`qzeros` 都按 32bit 容器 + 4bit lane 提取
 - `g_idx` 在 CUDA `_g` 和 Triton 都参与索引 `scales/zeros`
 - 累加精度：中间基本用 fp32（CUDA `_g` 最终原子加到 half，精度略弱于纯 fp32 输出路径）
+
+#### matmul_248_kernel
+
+```python
+def matmul_248_kernel(
+    a_ptr, b_ptr, c_ptr, scales_ptr, zeros_ptr, g_ptr,  # 各输入/输出张量首地址指针
+    M, N, K,                                             # 矩阵维度：A(M,K), W(K,N), C(M,N)
+    bits, maxq,                                          # 量化位宽、最大量化值（4bit 时 maxq=15）
+    stride_am, stride_ak,                                # A 的行/列步长
+    stride_bk, stride_bn,                                # B(qweight) 的“行/列”步长（按压缩存储）
+    stride_cm, stride_cn,                                # C 的行/列步长
+    stride_scales, stride_zeros,                         # scales / zeros 的行步长（group 维）
+    BLOCK_SIZE_M: tl.constexpr,                          # tile 在 M 方向大小（编译期常量）
+    BLOCK_SIZE_N: tl.constexpr,                          # tile 在 N 方向大小
+    BLOCK_SIZE_K: tl.constexpr,                          # tile 在 K 方向分块大小
+    GROUP_SIZE_M: tl.constexpr                           # program 分组参数，提高 L2 局部性
+):
+```
+
+用了 grouped ordering（按 M 分组），目的是让一小段 pid 优先处理相近的 M-tile，从而更好复用 cache/L2。
+
+num_pid_m = 5，num_pid_n = 2，GROUP_SIZE_M = 3，按 aixs = 0 排列 pid 如下
+
+```
+0 3
+1 4
+2 5
+6 8
+7 9
+```
+
+num_pid_in_group = GROUP_SIZE_M * num_pid_n = 6 表示每个 group 包含的 program 数。
+
+对于 pid = 8，group_id = pid // num_pid_in_group = 1 表示当前 pid 属于第 2 个 group。
+
+first_pid_m = group_id * GROUP_SIZE_M = 3，表示当前 group 的第一个 pid 在 M 方向的索引。
+
+group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M) = 2 表示 该组真实有多少行（最后一组可能不满）。
+
+pid_m = first_pid_m + (pid % group_size_m)  = 3 表示 组内 pid 映射到 m
+
+pid_n = (pid % num_pid_in_group) // group_size_m = 1 表示 组内 pid 映射到 n
+
+计算得到 pid_m 和 pid_n 后，就可以计算当前 pid 负责的 tile 在 M/N 方向的索引 offs_am 和 offs_bm 了。行优先存储，offs_am * stride_am 得到对应行的首地址，+ offs_k[None, :] * stride_ak 广播得到 A 中第一个 block 的元素的地址 a_ptrs。
+
+```python
+offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)  
+# 当前 tile 覆盖的 A/C 行号（长度 BLOCK_SIZE_M）
+
+offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)  
+# 当前 tile 覆盖的 B/C 列号（长度 BLOCK_SIZE_N）
+
+offs_k = tl.arange(0, BLOCK_SIZE_K)  
+# 当前 K 分块内的局部 K 偏移（0...BLOCK_SIZE_K-1）
+
+a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)  
+# A tile 指针矩阵，形状 (BM, BK)
+
+a_mask = (offs_am[:, None] < M)  
+# A 的越界 mask（行方向），越界元素读 0
+
+b_ptrs = b_ptr + ((offs_k[:, None] // infearure_per_bits) * stride_bk + offs_bn[None, :] * stride_bn)  
+# B(qweight) 的指针矩阵，形状 (BK, BN)
+# 注意 K 被压缩：每 infearure_per_bits 个 k 共用一个 int32 存储单元
+```
+
+累加用 fp32，提升数值稳定性
+
+```python
+ g_ptrs = g_ptr + offs_k  
+# 当前 K 分块对应的 group 索引地址（后续每个 k 会查所属 group）
+
+scales_ptrs = scales_ptr + offs_bn[None, :]  
+# scales 基础列地址（后续再按 g_idx * stride_scales 选 group 行）
+
+zeros_ptrs = zeros_ptr + (offs_bn[None, :] // infearure_per_bits)  
+# zeros 是按位打包的，列方向也需先除以每 int32 可容纳个数
+
+shifter = (offs_k % infearure_per_bits) * bits  
+# 对 qweight 解包的位移量：k 对应 int32 内第几个量化槽位
+
+zeros_shifter = (offs_bn % infearure_per_bits) * bits  
+# 对 qzeros 解包的位移量：n 对应 int32 内第几个量化槽位
+
+accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)  
+# fp32 累加器，提升数值稳定性
+```
+
+for 循环沿 K 维迭代，每次处理 BK 宽度的 A tile 和 B tile，并累加到 accumulator 中。
+
+```python
+for k in range(0, num_pid_k):
+    g_idx = tl.load(g_ptrs)  
+    scales = tl.load(scales_ptrs + g_idx[:, None] * stride_scales)  # 读取对应 group 的 scales，形状 (BK, BN)
+    zeros = tl.load(zeros_ptrs + g_idx[:, None] * stride_zeros)  # 读取对应 group 的打包 zeros，形状 (BK, BN-packed)
+
+    zeros = (zeros >> zeros_shifter[None, :]) & maxq  # 解包 zeros：右移后按 maxq 掩码取低 bits 位
+
+    zeros = (zeros + 1)   # 与 pack 时 zeros-=1 对应，这里恢复回推理使用的 zero 点
+
+    a = tl.load(a_ptrs, mask=a_mask, other=0.)  # 读取 A tile，越界行填 0，形状 (BM, BK)
+    b = tl.load(b_ptrs)  
+
+    b = (b >> shifter[:, None]) & maxq  # 解包 qweight：抽取每个 k 对应的 bits 值，得到量化整数
+
+    b = (b - zeros) * scales  # 反量化： (q - z) * s，得到近似浮点权重
+
+    accumulator += tl.dot(a, b)  
+
+    a_ptrs += BLOCK_SIZE_K  
+    b_ptrs += (BLOCK_SIZE_K // infearure_per_bits) * stride_bk  
+    g_ptrs += BLOCK_SIZE_K  
+```
+
+最后将结果写入 c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]。
+
+
+### 后量化
+
+低精度量化，如 4bit 以后，如果模型性能损失超出预期，可以考虑后量化。
+
+对量化权重做微调，包括 scale 和 zero-point。
+
+需要注意的是要完成反向 kernel 的实现。

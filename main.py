@@ -519,6 +519,9 @@ if __name__ == '__main__':
 
     tokenizer, model = load_model_tokenizer(args)
 
+    if "Qwen3" in args.base_model or "Qwen2.5" in args.base_model or "Qwen1.5" in args.base_model:
+        args.base_model = args.base_model.replace("Qwen", "LlamaQwen")
+
     # 如果指定了加载SPSR层的路径，则加载并替换
     if args.load_spsr_path is not None:
         model = load_spsr_layers(model, args.load_spsr_path, model_type=args.base_model)
@@ -553,8 +556,6 @@ if __name__ == '__main__':
         "taylor": TaylorPruner, "taylori": TaylorIterPruner,
     }
     random.seed(args.seed)
-    if "Qwen3" or "Qwen2.5" or "Qwen1.5" in args.base_model:
-        args.base_model = args.base_model.replace("Qwen", "LlamaQwen")
     if args.pruner is not None:
         if len(args.all_layer_ratio) == 0:
             layer_sp = layer_sp_dic[args.layer](model, tokenizer)

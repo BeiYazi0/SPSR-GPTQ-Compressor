@@ -5,7 +5,7 @@
 
 高效层剪枝SPSR通过最小皮尔逊相关系数估测层的恢复能力，用 scale + bias 架构替换恢复能力强的层，并采用next-token prediction loss训练 scale/bias vectors，仅需 128 samples 和数分钟即可达到较好的性能。
 
- [SPSR: Achieving Superior Large Language Model Layer Pruning Performance by Super-fast Recovery](https://openreview.net/forum?id=NlkPKk37bT)
+ [SPSR: Achieving Superior Large Language Model Layer Pruning Performance by Super-fast Recovery](https://openreview.net/forum?id=zBswcgygZh)
 
 LoRA 微调
 nvidia供了一份关于使用剪枝和蒸馏技术将Llama 3.1 8B和Mistral NeMo 12B 模型分别压缩为Llama-3.1-Minitron-4B和MN-Minitron-8B的全面报告（LLM Pruning and Distillation in Practice: The Minitron Approach. 2024），
